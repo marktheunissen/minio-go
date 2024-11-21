@@ -142,7 +142,7 @@ func baseLogger(testName, function string, args map[string]interface{}, startTim
 	return l
 }
 
-// log successful test runs
+// log successful test run
 func logSuccess(testName, function string, args map[string]interface{}, startTime time.Time) {
 	baseLogger(testName, function, args, startTime).
 		With("status", "PASS").
@@ -393,6 +393,136 @@ func getFuncNameLoc(caller int) string {
 	return strings.TrimPrefix(runtime.FuncForPC(pc).Name(), "main.")
 }
 
+type FunctionalTest struct {
+	StartTime time.Time
+	TestName  string
+	Function  string
+	Args      map[string]interface{}
+
+	Client *minio.Client
+	Core   *minio.Core
+
+	BucketObjectLocking bool
+	BucketName          string
+}
+
+type Config struct {
+	// Logging params
+	TestName string
+	Function string
+	Args     map[string]interface{}
+
+	// MinIO client configuration
+	TraceOn bool // Turn on tracing of HTTP requests and responses to stderr
+	CredsV2 bool // Use V2 credentials if true, otherwise use v4
+
+	// Bucket options
+	ExcludeBucketCreation bool   // Bucket fixture is created, unless you opt out
+	BucketRegion          string // Bucket region, defaults to 'us-east-1'
+	BucketObjectLocking   bool   // Enable object locking on the bucket
+	BucketVersioning      bool   // Enable versioning on the bucket, requires BucketObjectLocking to be true
+}
+
+func NewTest(config Config) (*FunctionalTest, context.Context, string, *minio.Client, *minio.Core, error) {
+	var err error
+	ctx := context.Background()
+
+	if config.Args == nil {
+		config.Args = make(map[string]interface{})
+	}
+
+	t := &FunctionalTest{
+		StartTime:           time.Now(),
+		TestName:            config.TestName,
+		Function:            config.Function,
+		Args:                config.Args,
+		BucketObjectLocking: config.BucketObjectLocking,
+	}
+
+	// Apply some defaults
+	if config.BucketRegion == "" {
+		config.BucketRegion = "us-east-1"
+	}
+
+	// Instantiate new MinIO client and core object.
+	var creds *credentials.Credentials
+	if config.CredsV2 {
+		creds = credentials.NewStaticV2(os.Getenv(accessKey), os.Getenv(secretKey), "")
+	} else {
+		creds = credentials.NewStaticV4(os.Getenv(accessKey), os.Getenv(secretKey), "")
+	}
+	opts := &minio.Options{
+		Creds:     creds,
+		Transport: createHTTPTransport(),
+		Secure:    mustParseBool(os.Getenv(enableHTTPS)),
+	}
+	t.Client, err = minio.New(os.Getenv(serverEndpoint), opts)
+	if err != nil {
+		t.LogError("MinIO client object creation failed", err)
+		return nil, nil, "", nil, nil, err
+	}
+	t.Core, err = minio.NewCore(os.Getenv(serverEndpoint), opts)
+	if err != nil {
+		t.LogError("MinIO core client object creation failed", err)
+		return nil, nil, "", nil, nil, err
+	}
+
+	if config.TraceOn {
+		t.Client.TraceOn(os.Stderr)
+	}
+
+	// Bucket fixture
+	if !config.ExcludeBucketCreation {
+		// Generate a new random bucket name.
+		bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
+		t.Args["bucketName"] = bucketName
+		t.BucketName = bucketName
+
+		// Make a new bucket.
+		opts := minio.MakeBucketOptions{Region: config.BucketRegion, ObjectLocking: config.BucketObjectLocking}
+		err = t.Client.MakeBucket(ctx, bucketName, opts)
+		if err != nil {
+			t.LogError("Make bucket failed", err)
+			return nil, nil, "", nil, nil, err
+		}
+
+		if config.BucketVersioning {
+			err = t.Client.EnableVersioning(context.Background(), bucketName)
+			if err != nil {
+				t.LogError("Enable versioning failed", err)
+				return nil, nil, "", nil, nil, err
+			}
+		}
+	}
+
+	// Set user agent.
+	t.Client.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
+
+	return t, ctx, t.BucketName, t.Client, t.Core, nil
+}
+
+func (t *FunctionalTest) LogError(msg string, err error) {
+	logError(t.TestName, t.Function, t.Args, t.StartTime, "", msg, err)
+}
+
+func (t *FunctionalTest) LogSuccess() {
+	logSuccess(t.TestName, t.Function, t.Args, t.StartTime)
+}
+
+func (t *FunctionalTest) Cleanup() {
+	if t.BucketObjectLocking {
+		err := cleanupVersionedBucket(t.BucketName, t.Client)
+		if err != nil {
+			t.LogError("cleanupVersionedBucket failed", err)
+		}
+	} else {
+		err := cleanupBucket(t.BucketName, t.Client)
+		if err != nil {
+			t.LogError("cleanupBucket failed", err)
+		}
+	}
+}
+
 // Tests bucket re-create errors.
 func testMakeBucketError() {
 	region := "eu-central-1"
@@ -407,9 +537,6 @@ func testMakeBucketError() {
 		"region":     region,
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -421,12 +548,6 @@ func testMakeBucketError() {
 		logError(testName, function, args, startTime, "", "MinIO client creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -462,7 +583,6 @@ func testMetadataSizeLimit() {
 		"objectName":        "",
 		"opts.UserMetadata": "",
 	}
-	rand.Seed(startTime.Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -531,9 +651,6 @@ func testMakeBucketRegions() {
 		"region":     region,
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -545,12 +662,6 @@ func testMakeBucketRegions() {
 		logError(testName, function, args, startTime, "", "MinIO client creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -598,9 +709,6 @@ func testPutObjectReadAt() {
 		"opts":       "objectContentType",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -612,12 +720,6 @@ func testPutObjectReadAt() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -697,9 +799,6 @@ func testListObjectVersions() {
 		"recursive":  "",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -711,12 +810,6 @@ func testListObjectVersions() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -817,9 +910,6 @@ func testStatObjectWithVersioning() {
 	function := "StatObject"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -831,12 +921,6 @@ func testStatObjectWithVersioning() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -935,9 +1019,6 @@ func testGetObjectWithVersioning() {
 	function := "GetObject()"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -949,12 +1030,6 @@ func testGetObjectWithVersioning() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -1075,9 +1150,6 @@ func testPutObjectWithVersioning() {
 	function := "GetObject()"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -1089,12 +1161,6 @@ func testPutObjectWithVersioning() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -1217,51 +1283,16 @@ func testPutObjectWithVersioning() {
 }
 
 func testListMultipartUpload() {
-	// initialize logging params
-	startTime := time.Now()
-	testName := getFuncName()
-	function := "GetObject()"
-	args := map[string]interface{}{}
-
-	// Instantiate new minio client object.
-	opts := &minio.Options{
-		Creds:     credentials.NewStaticV4(os.Getenv(accessKey), os.Getenv(secretKey), ""),
-		Transport: createHTTPTransport(),
-		Secure:    mustParseBool(os.Getenv(enableHTTPS)),
-	}
-	c, err := minio.New(os.Getenv(serverEndpoint), opts)
+	t, ctx, bucketName, _, core, err := NewTest(Config{
+		TestName:            getFuncName(),
+		Function:            "GetObject()",
+		BucketObjectLocking: true,
+	})
 	if err != nil {
-		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-	core, err := minio.NewCore(os.Getenv(serverEndpoint), opts)
-	if err != nil {
-		logError(testName, function, args, startTime, "", "MinIO core client object creation failed", err)
-		return
-	}
+	defer t.Cleanup()
 
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
-
-	// Generate a new random bucket name.
-	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
-	args["bucketName"] = bucketName
-
-	// Make a new bucket.
-	ctx := context.Background()
-	err = c.MakeBucket(ctx, bucketName, minio.MakeBucketOptions{Region: "us-east-1", ObjectLocking: true})
-	if err != nil {
-		logError(testName, function, args, startTime, "", "Make bucket failed", err)
-		return
-	}
-	defer func() {
-		if err = cleanupVersionedBucket(bucketName, c); err != nil {
-			logError(testName, function, args, startTime, "", "CleanupBucket failed", err)
-		}
-	}()
 	objName := "prefix/objectName"
 
 	want := minio.ListMultipartUploadsResult{
@@ -1280,7 +1311,7 @@ func testListMultipartUpload() {
 	for i := 0; i < 5; i++ {
 		uid, err := core.NewMultipartUpload(ctx, bucketName, objName, minio.PutObjectOptions{})
 		if err != nil {
-			logError(testName, function, args, startTime, "", "NewMultipartUpload failed", err)
+			t.LogError("NewMultipartUpload failed", err)
 			return
 		}
 		want.Uploads = append(want.Uploads, minio.ObjectMultipartInfo{
@@ -1299,13 +1330,13 @@ func testListMultipartUpload() {
 				}
 				if !reflect.DeepEqual(want, got) {
 					err := fmt.Errorf("want: %#v\ngot : %#v", want, got)
-					logError(testName, function, args, startTime, "", call+" failed", err)
+					t.LogError(call+" failed", err)
 				}
 				return true
 			}
 			got, err := core.ListMultipartUploads(ctx, bucketName, objName, "", "", "/", 1000)
 			if err != nil {
-				logError(testName, function, args, startTime, "", "ListMultipartUploads failed", err)
+				t.LogError("ListMultipartUploads failed", err)
 				return
 			}
 			if !cmpGot("ListMultipartUploads-prefix", got) {
@@ -1314,7 +1345,7 @@ func testListMultipartUpload() {
 			got, err = core.ListMultipartUploads(ctx, bucketName, objName, objName, "", "/", 1000)
 			got.KeyMarker = ""
 			if err != nil {
-				logError(testName, function, args, startTime, "", "ListMultipartUploads failed", err)
+				t.LogError("ListMultipartUploads failed", err)
 				return
 			}
 			if !cmpGot("ListMultipartUploads-marker", got) {
@@ -1324,7 +1355,7 @@ func testListMultipartUpload() {
 		if i > 2 {
 			err = core.AbortMultipartUpload(ctx, bucketName, objName, uid)
 			if err != nil {
-				logError(testName, function, args, startTime, "", "AbortMultipartUpload failed", err)
+				t.LogError("AbortMultipartUpload failed", err)
 				return
 			}
 			want.Uploads = want.Uploads[:len(want.Uploads)-1]
@@ -1333,82 +1364,49 @@ func testListMultipartUpload() {
 	for _, up := range want.Uploads {
 		err = core.AbortMultipartUpload(ctx, bucketName, objName, up.UploadID)
 		if err != nil {
-			logError(testName, function, args, startTime, "", "AbortMultipartUpload failed", err)
+			t.LogError("AbortMultipartUpload failed", err)
 			return
 		}
 	}
-	logSuccess(testName, function, args, startTime)
+	t.LogSuccess()
 }
 
 func testCopyObjectWithVersioning() {
-	// initialize logging params
-	startTime := time.Now()
-	testName := getFuncName()
-	function := "CopyObject()"
-	args := map[string]interface{}{}
-
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
-	// Instantiate new minio client object.
-	c, err := minio.New(os.Getenv(serverEndpoint),
-		&minio.Options{
-			Creds:     credentials.NewStaticV4(os.Getenv(accessKey), os.Getenv(secretKey), ""),
-			Transport: createHTTPTransport(),
-			Secure:    mustParseBool(os.Getenv(enableHTTPS)),
-		})
+	t, ctx, bucketName, c, _, err := NewTest(Config{
+		TestName:            getFuncName(),
+		Function:            "CopyObject()",
+		BucketObjectLocking: true,
+		BucketVersioning:    true,
+	})
 	if err != nil {
-		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
-
-	// Generate a new random bucket name.
-	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
-	args["bucketName"] = bucketName
-
-	// Make a new bucket.
-	err = c.MakeBucket(context.Background(), bucketName, minio.MakeBucketOptions{Region: "us-east-1", ObjectLocking: true})
-	if err != nil {
-		logError(testName, function, args, startTime, "", "Make bucket failed", err)
-		return
-	}
-
-	err = c.EnableVersioning(context.Background(), bucketName)
-	if err != nil {
-		logError(testName, function, args, startTime, "", "Enable versioning failed", err)
-		return
-	}
+	defer t.Cleanup()
 
 	objectName := randString(60, rand.NewSource(time.Now().UnixNano()), "")
-	args["objectName"] = objectName
+	t.Args["objectName"] = objectName
 
 	testFiles := []string{"datafile-1-b", "datafile-10-kB"}
 	for _, testFile := range testFiles {
 		r := getDataReader(testFile)
 		buf, err := io.ReadAll(r)
 		if err != nil {
-			logError(testName, function, args, startTime, "", "unexpected failure", err)
+			t.LogError("unexpected failure", err)
 			return
 		}
 		r.Close()
-		_, err = c.PutObject(context.Background(), bucketName, objectName, bytes.NewReader(buf), int64(len(buf)), minio.PutObjectOptions{})
+		_, err = c.PutObject(ctx, bucketName, objectName, bytes.NewReader(buf), int64(len(buf)), minio.PutObjectOptions{})
 		if err != nil {
-			logError(testName, function, args, startTime, "", "PutObject failed", err)
+			t.LogError("PutObject failed", err)
 			return
 		}
 	}
 
-	objectsInfo := c.ListObjects(context.Background(), bucketName, minio.ListObjectsOptions{WithVersions: true, Recursive: true})
+	objectsInfo := c.ListObjects(ctx, bucketName, minio.ListObjectsOptions{WithVersions: true, Recursive: true})
 	var infos []minio.ObjectInfo
 	for info := range objectsInfo {
 		if info.Err != nil {
-			logError(testName, function, args, startTime, "", "Unexpected error during listing objects", err)
+			t.LogError("Unexpected error during listing objects", err)
 			return
 		}
 		infos = append(infos, info)
@@ -1418,15 +1416,15 @@ func testCopyObjectWithVersioning() {
 		return infos[i].Size < infos[j].Size
 	})
 
-	reader, err := c.GetObject(context.Background(), bucketName, objectName, minio.GetObjectOptions{VersionID: infos[0].VersionID})
+	reader, err := c.GetObject(ctx, bucketName, objectName, minio.GetObjectOptions{VersionID: infos[0].VersionID})
 	if err != nil {
-		logError(testName, function, args, startTime, "", "GetObject of the oldest version content failed", err)
+		t.LogError("GetObject of the oldest version content failed", err)
 		return
 	}
 
 	oldestContent, err := io.ReadAll(reader)
 	if err != nil {
-		logError(testName, function, args, startTime, "", "Reading the oldest object version failed", err)
+		t.LogError("Reading the oldest object version failed", err)
 		return
 	}
 
@@ -1436,117 +1434,84 @@ func testCopyObjectWithVersioning() {
 		Object:    objectName,
 		VersionID: infos[0].VersionID,
 	}
-	args["src"] = srcOpts
+	t.Args["src"] = srcOpts
 
 	dstOpts := minio.CopyDestOptions{
 		Bucket: bucketName,
 		Object: objectName + "-copy",
 	}
-	args["dst"] = dstOpts
+	t.Args["dst"] = dstOpts
 
 	// Perform the Copy
-	if _, err = c.CopyObject(context.Background(), dstOpts, srcOpts); err != nil {
-		logError(testName, function, args, startTime, "", "CopyObject failed", err)
+	if _, err = c.CopyObject(ctx, dstOpts, srcOpts); err != nil {
+		t.LogError("CopyObject failed", err)
 		return
 	}
 
 	// Destination object
-	readerCopy, err := c.GetObject(context.Background(), bucketName, objectName+"-copy", minio.GetObjectOptions{})
+	readerCopy, err := c.GetObject(ctx, bucketName, objectName+"-copy", minio.GetObjectOptions{})
 	if err != nil {
-		logError(testName, function, args, startTime, "", "GetObject failed", err)
+		t.LogError("GetObject failed", err)
 		return
 	}
 	defer readerCopy.Close()
 
 	newestContent, err := io.ReadAll(readerCopy)
 	if err != nil {
-		logError(testName, function, args, startTime, "", "Reading from GetObject reader failed", err)
+		t.LogError("Reading from GetObject reader failed", err)
 		return
 	}
 
 	if len(newestContent) == 0 || !bytes.Equal(oldestContent, newestContent) {
-		logError(testName, function, args, startTime, "", "Unexpected destination object content", err)
+		t.LogError("Unexpected destination object content", err)
 		return
 	}
 
 	// Delete all objects and their versions as long as the bucket itself
 	if err = cleanupVersionedBucket(bucketName, c); err != nil {
-		logError(testName, function, args, startTime, "", "CleanupBucket failed", err)
+		t.LogError("CleanupBucket failed", err)
 		return
 	}
 
-	logSuccess(testName, function, args, startTime)
+	t.LogSuccess()
 }
 
 func testConcurrentCopyObjectWithVersioning() {
-	// initialize logging params
-	startTime := time.Now()
-	testName := getFuncName()
-	function := "CopyObject()"
-	args := map[string]interface{}{}
-
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
-	// Instantiate new minio client object.
-	c, err := minio.New(os.Getenv(serverEndpoint),
-		&minio.Options{
-			Creds:     credentials.NewStaticV4(os.Getenv(accessKey), os.Getenv(secretKey), ""),
-			Transport: createHTTPTransport(),
-			Secure:    mustParseBool(os.Getenv(enableHTTPS)),
-		})
+	t, ctx, bucketName, c, _, err := NewTest(Config{
+		TestName:            getFuncName(),
+		Function:            "CopyObject()",
+		BucketObjectLocking: true,
+		BucketVersioning:    true,
+	})
 	if err != nil {
-		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
-
-	// Generate a new random bucket name.
-	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
-	args["bucketName"] = bucketName
-
-	// Make a new bucket.
-	err = c.MakeBucket(context.Background(), bucketName, minio.MakeBucketOptions{Region: "us-east-1", ObjectLocking: true})
-	if err != nil {
-		logError(testName, function, args, startTime, "", "Make bucket failed", err)
-		return
-	}
-
-	err = c.EnableVersioning(context.Background(), bucketName)
-	if err != nil {
-		logError(testName, function, args, startTime, "", "Enable versioning failed", err)
-		return
-	}
+	defer t.Cleanup()
 
 	objectName := randString(60, rand.NewSource(time.Now().UnixNano()), "")
-	args["objectName"] = objectName
+	t.Args["objectName"] = objectName
 
 	testFiles := []string{"datafile-10-kB"}
 	for _, testFile := range testFiles {
 		r := getDataReader(testFile)
 		buf, err := io.ReadAll(r)
 		if err != nil {
-			logError(testName, function, args, startTime, "", "unexpected failure", err)
+			t.LogError("unexpected failure", err)
 			return
 		}
 		r.Close()
-		_, err = c.PutObject(context.Background(), bucketName, objectName, bytes.NewReader(buf), int64(len(buf)), minio.PutObjectOptions{})
+		_, err = c.PutObject(ctx, bucketName, objectName, bytes.NewReader(buf), int64(len(buf)), minio.PutObjectOptions{})
 		if err != nil {
-			logError(testName, function, args, startTime, "", "PutObject failed", err)
+			t.LogError("PutObject failed", err)
 			return
 		}
 	}
 
-	objectsInfo := c.ListObjects(context.Background(), bucketName, minio.ListObjectsOptions{WithVersions: true, Recursive: true})
+	objectsInfo := c.ListObjects(ctx, bucketName, minio.ListObjectsOptions{WithVersions: true, Recursive: true})
 	var infos []minio.ObjectInfo
 	for info := range objectsInfo {
 		if info.Err != nil {
-			logError(testName, function, args, startTime, "", "Unexpected error during listing objects", err)
+			t.LogError("Unexpected error during listing objects", err)
 			return
 		}
 		infos = append(infos, info)
@@ -1556,15 +1521,15 @@ func testConcurrentCopyObjectWithVersioning() {
 		return infos[i].Size < infos[j].Size
 	})
 
-	reader, err := c.GetObject(context.Background(), bucketName, objectName, minio.GetObjectOptions{VersionID: infos[0].VersionID})
+	reader, err := c.GetObject(ctx, bucketName, objectName, minio.GetObjectOptions{VersionID: infos[0].VersionID})
 	if err != nil {
-		logError(testName, function, args, startTime, "", "GetObject of the oldest version content failed", err)
+		t.LogError("GetObject of the oldest version content failed", err)
 		return
 	}
 
 	oldestContent, err := io.ReadAll(reader)
 	if err != nil {
-		logError(testName, function, args, startTime, "", "Reading the oldest object version failed", err)
+		t.LogError("Reading the oldest object version failed", err)
 		return
 	}
 
@@ -1574,13 +1539,13 @@ func testConcurrentCopyObjectWithVersioning() {
 		Object:    objectName,
 		VersionID: infos[0].VersionID,
 	}
-	args["src"] = srcOpts
+	t.Args["src"] = srcOpts
 
 	dstOpts := minio.CopyDestOptions{
 		Bucket: bucketName,
 		Object: objectName + "-copy",
 	}
-	args["dst"] = dstOpts
+	t.Args["dst"] = dstOpts
 
 	// Perform the Copy concurrently
 	const n = 10
@@ -1590,53 +1555,47 @@ func testConcurrentCopyObjectWithVersioning() {
 	for i := 0; i < n; i++ {
 		go func(i int) {
 			defer wg.Done()
-			_, errs[i] = c.CopyObject(context.Background(), dstOpts, srcOpts)
+			_, errs[i] = c.CopyObject(ctx, dstOpts, srcOpts)
 		}(i)
 	}
 	wg.Wait()
 	for _, err := range errs {
 		if err != nil {
-			logError(testName, function, args, startTime, "", "CopyObject failed", err)
+			t.LogError("CopyObject failed", err)
 			return
 		}
 	}
 
-	objectsInfo = c.ListObjects(context.Background(), bucketName, minio.ListObjectsOptions{WithVersions: true, Recursive: false, Prefix: dstOpts.Object})
+	objectsInfo = c.ListObjects(ctx, bucketName, minio.ListObjectsOptions{WithVersions: true, Recursive: false, Prefix: dstOpts.Object})
 	infos = []minio.ObjectInfo{}
 	for info := range objectsInfo {
 		// Destination object
-		readerCopy, err := c.GetObject(context.Background(), bucketName, objectName+"-copy", minio.GetObjectOptions{VersionID: info.VersionID})
+		readerCopy, err := c.GetObject(ctx, bucketName, objectName+"-copy", minio.GetObjectOptions{VersionID: info.VersionID})
 		if err != nil {
-			logError(testName, function, args, startTime, "", "GetObject failed", err)
+			t.LogError("GetObject failed", err)
 			return
 		}
 		defer readerCopy.Close()
 
 		newestContent, err := io.ReadAll(readerCopy)
 		if err != nil {
-			logError(testName, function, args, startTime, "", "Reading from GetObject reader failed", err)
+			t.LogError("Reading from GetObject reader failed", err)
 			return
 		}
 
 		if len(newestContent) == 0 || !bytes.Equal(oldestContent, newestContent) {
-			logError(testName, function, args, startTime, "", "Unexpected destination object content", err)
+			t.LogError("Unexpected destination object content", err)
 			return
 		}
 		infos = append(infos, info)
 	}
 
 	if len(infos) != n {
-		logError(testName, function, args, startTime, "", "Unexpected number of Version elements in listing objects", nil)
+		t.LogError("Unexpected number of Version elements in listing objects", nil)
 		return
 	}
 
-	// Delete all objects and their versions as long as the bucket itself
-	if err = cleanupVersionedBucket(bucketName, c); err != nil {
-		logError(testName, function, args, startTime, "", "CleanupBucket failed", err)
-		return
-	}
-
-	logSuccess(testName, function, args, startTime)
+	t.LogSuccess()
 }
 
 func testComposeObjectWithVersioning() {
@@ -1645,9 +1604,6 @@ func testComposeObjectWithVersioning() {
 	testName := getFuncName()
 	function := "ComposeObject()"
 	args := map[string]interface{}{}
-
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -1660,12 +1616,6 @@ func testComposeObjectWithVersioning() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -1787,9 +1737,6 @@ func testRemoveObjectWithVersioning() {
 	function := "DeleteObject()"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -1801,12 +1748,6 @@ func testRemoveObjectWithVersioning() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -1900,9 +1841,6 @@ func testRemoveObjectsWithVersioning() {
 	function := "DeleteObjects()"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -1914,12 +1852,6 @@ func testRemoveObjectsWithVersioning() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -1996,9 +1928,6 @@ func testObjectTaggingWithVersioning() {
 	function := "{Get,Set,Remove}ObjectTagging()"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -2010,12 +1939,6 @@ func testObjectTaggingWithVersioning() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -2164,9 +2087,6 @@ func testPutObjectWithChecksums() {
 		return
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -2178,12 +2098,6 @@ func testPutObjectWithChecksums() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -2350,9 +2264,6 @@ func testPutObjectWithTrailingChecksums() {
 		return
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -2365,12 +2276,6 @@ func testPutObjectWithTrailingChecksums() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -2541,9 +2446,6 @@ func testPutMultipartObjectWithChecksums(trailing bool) {
 		return
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -2556,12 +2458,6 @@ func testPutMultipartObjectWithChecksums(trailing bool) {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -2620,7 +2516,7 @@ func testPutMultipartObjectWithChecksums(trailing bool) {
 		cmpChecksum := func(got, want string) {
 			if want != got {
 				logError(testName, function, args, startTime, "", "checksum mismatch", fmt.Errorf("want %s, got %s", want, got))
-				//fmt.Printf("want %s, got %s\n", want, got)
+				// fmt.Printf("want %s, got %s\n", want, got)
 				return
 			}
 		}
@@ -2753,12 +2649,6 @@ func testTrailingChecksums() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -2952,9 +2842,6 @@ func testPutObjectWithAutomaticChecksums() {
 		return
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -2967,9 +2854,6 @@ func testPutObjectWithAutomaticChecksums() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -2996,10 +2880,6 @@ func testPutObjectWithAutomaticChecksums() {
 		// Built-in will only add crc32c, when no MD5 nor SHA256.
 		{header: "x-amz-checksum-crc32c", hasher: crc32.New(crc32.MakeTable(crc32.Castagnoli))},
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-	// defer c.TraceOff()
 
 	for i, test := range tests {
 		bufSize := dataFileMap["datafile-10-kB"]
@@ -3657,9 +3537,6 @@ func testPutObjectWithMetadata() {
 		return
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -3671,12 +3548,6 @@ func testPutObjectWithMetadata() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -3764,9 +3635,6 @@ func testPutObjectWithContentLanguage() {
 		"opts":       "",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -3778,12 +3646,6 @@ func testPutObjectWithContentLanguage() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -3834,9 +3696,6 @@ func testPutObjectStreaming() {
 		"opts":       "",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -3848,12 +3707,6 @@ func testPutObjectStreaming() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -3906,9 +3759,6 @@ func testGetObjectSeekEnd() {
 	function := "GetObject(bucketName, objectName)"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -3920,12 +3770,6 @@ func testGetObjectSeekEnd() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -4029,9 +3873,6 @@ func testGetObjectClosedTwice() {
 	function := "GetObject(bucketName, objectName)"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -4043,12 +3884,6 @@ func testGetObjectClosedTwice() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -4135,8 +3970,6 @@ func testRemoveObjectsContext() {
 		return
 	}
 
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 	// Enable tracing, write to stdout.
 	// c.TraceOn(os.Stderr)
 
@@ -4217,9 +4050,6 @@ func testRemoveMultipleObjects() {
 		"bucketName": "",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -4231,9 +4061,6 @@ func testRemoveMultipleObjects() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Enable tracing, write to stdout.
 	// c.TraceOn(os.Stderr)
@@ -4301,9 +4128,6 @@ func testRemoveMultipleObjectsWithResult() {
 		"bucketName": "",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -4315,9 +4139,6 @@ func testRemoveMultipleObjectsWithResult() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Enable tracing, write to stdout.
 	// c.TraceOn(os.Stderr)
@@ -4437,9 +4258,6 @@ func testFPutObjectMultipart() {
 		"opts":       "",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -4451,12 +4269,6 @@ func testFPutObjectMultipart() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -4543,9 +4355,6 @@ func testFPutObject() {
 		"opts":       "",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -4557,12 +4366,6 @@ func testFPutObject() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -4713,8 +4516,6 @@ func testFPutObjectContext() {
 		"fileName":   "",
 		"opts":       "",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -4727,12 +4528,6 @@ func testFPutObjectContext() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -4814,8 +4609,6 @@ func testFPutObjectContextV2() {
 		"objectName": "",
 		"opts":       "minio.PutObjectOptions{ContentType:objectContentType}",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -4828,12 +4621,6 @@ func testFPutObjectContextV2() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -4931,12 +4718,6 @@ func testPutObjectContext() {
 		return
 	}
 
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
-
 	// Make a new bucket.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
 	args["bucketName"] = bucketName
@@ -4989,9 +4770,6 @@ func testGetObjectS3Zip() {
 	function := "GetObject(bucketName, objectName)"
 	args := map[string]interface{}{"x-minio-extract": true}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -5003,12 +4781,6 @@ func testGetObjectS3Zip() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -5173,9 +4945,6 @@ func testGetObjectReadSeekFunctional() {
 	function := "GetObject(bucketName, objectName)"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -5187,12 +4956,6 @@ func testGetObjectReadSeekFunctional() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -5343,9 +5106,6 @@ func testGetObjectReadAtFunctional() {
 	function := "GetObject(bucketName, objectName)"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -5357,12 +5117,6 @@ func testGetObjectReadAtFunctional() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -5521,9 +5275,6 @@ func testGetObjectReadAtWhenEOFWasReached() {
 	function := "GetObject(bucketName, objectName)"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -5535,12 +5286,6 @@ func testGetObjectReadAtWhenEOFWasReached() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -5641,9 +5386,6 @@ func testPresignedPostPolicy() {
 		"policy": "",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -5655,12 +5397,6 @@ func testPresignedPostPolicy() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -5857,9 +5593,6 @@ func testCopyObject() {
 	function := "CopyObject(dst, src)"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -5871,12 +5604,6 @@ func testCopyObject() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -6052,9 +5779,6 @@ func testSSECEncryptedGetObjectReadSeekFunctional() {
 	function := "GetObject(bucketName, objectName)"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -6066,12 +5790,6 @@ func testSSECEncryptedGetObjectReadSeekFunctional() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -6235,9 +5953,6 @@ func testSSES3EncryptedGetObjectReadSeekFunctional() {
 	function := "GetObject(bucketName, objectName)"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -6249,12 +5964,6 @@ func testSSES3EncryptedGetObjectReadSeekFunctional() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -6416,9 +6125,6 @@ func testSSECEncryptedGetObjectReadAtFunctional() {
 	function := "GetObject(bucketName, objectName)"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -6430,12 +6136,6 @@ func testSSECEncryptedGetObjectReadAtFunctional() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -6600,9 +6300,6 @@ func testSSES3EncryptedGetObjectReadAtFunctional() {
 	function := "GetObject(bucketName, objectName)"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -6614,12 +6311,6 @@ func testSSES3EncryptedGetObjectReadAtFunctional() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -6785,8 +6476,6 @@ func testSSECEncryptionPutGet() {
 		"objectName": "",
 		"sse":        "",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -6799,12 +6488,6 @@ func testSSECEncryptionPutGet() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -6895,8 +6578,6 @@ func testSSECEncryptionFPut() {
 		"contentType": "",
 		"sse":         "",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -6909,12 +6590,6 @@ func testSSECEncryptionFPut() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -7018,8 +6693,6 @@ func testSSES3EncryptionPutGet() {
 		"objectName": "",
 		"sse":        "",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -7032,12 +6705,6 @@ func testSSES3EncryptionPutGet() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -7126,8 +6793,6 @@ func testSSES3EncryptionFPut() {
 		"contentType": "",
 		"sse":         "",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -7140,12 +6805,6 @@ func testSSES3EncryptionFPut() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -7255,9 +6914,6 @@ func testBucketNotification() {
 		return
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
 			Creds:     credentials.NewStaticV4(os.Getenv(accessKey), os.Getenv(secretKey), ""),
@@ -7271,9 +6927,6 @@ func testBucketNotification() {
 
 	// Enable to debug
 	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	bucketName := os.Getenv("NOTIFY_BUCKET")
 	args["bucketName"] = bucketName
@@ -7350,9 +7003,6 @@ func testFunctional() {
 	functionAll := ""
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
 			Creds:     credentials.NewStaticV4(os.Getenv(accessKey), os.Getenv(secretKey), ""),
@@ -7366,9 +7016,6 @@ func testFunctional() {
 
 	// Enable to debug
 	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -8041,12 +7688,6 @@ func testGetObjectModified() {
 		return
 	}
 
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
-
 	// Make a new bucket.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
 	args["bucketName"] = bucketName
@@ -8136,12 +7777,6 @@ func testPutObjectUploadSeekedObject() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Make a new bucket.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -8245,9 +7880,6 @@ func testMakeBucketErrorV2() {
 		"region":     "eu-west-1",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -8259,12 +7891,6 @@ func testMakeBucketErrorV2() {
 		logError(testName, function, args, startTime, "", "MinIO v2 client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -8305,9 +7931,6 @@ func testGetObjectClosedTwiceV2() {
 		"region":     "eu-west-1",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -8319,12 +7942,6 @@ func testGetObjectClosedTwiceV2() {
 		logError(testName, function, args, startTime, "", "MinIO v2 client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -8396,9 +8013,6 @@ func testFPutObjectV2() {
 		"opts":       "",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -8410,12 +8024,6 @@ func testFPutObjectV2() {
 		logError(testName, function, args, startTime, "", "MinIO v2 client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -8557,9 +8165,6 @@ func testMakeBucketRegionsV2() {
 		"region":     "eu-west-1",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -8571,12 +8176,6 @@ func testMakeBucketRegionsV2() {
 		logError(testName, function, args, startTime, "", "MinIO v2 client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -8620,9 +8219,6 @@ func testGetObjectReadSeekFunctionalV2() {
 	function := "GetObject(bucketName, objectName)"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -8634,12 +8230,6 @@ func testGetObjectReadSeekFunctionalV2() {
 		logError(testName, function, args, startTime, "", "MinIO v2 client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -8775,9 +8365,6 @@ func testGetObjectReadAtFunctionalV2() {
 	function := "GetObject(bucketName, objectName)"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -8789,12 +8376,6 @@ func testGetObjectReadAtFunctionalV2() {
 		logError(testName, function, args, startTime, "", "MinIO v2 client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -8937,9 +8518,6 @@ func testCopyObjectV2() {
 	function := "CopyObject(destination, source)"
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -8951,12 +8529,6 @@ func testCopyObjectV2() {
 		logError(testName, function, args, startTime, "", "MinIO v2 client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -9889,12 +9461,6 @@ func testSSECMultipartEncryptedToSSECCopyObjectPart() {
 	// Instantiate new core client object.
 	c := minio.Core{client}
 
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
-
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test")
 
@@ -10087,12 +9653,6 @@ func testSSECEncryptedToSSECCopyObjectPart() {
 	// Instantiate new core client object.
 	c := minio.Core{client}
 
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
-
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test")
 
@@ -10265,12 +9825,6 @@ func testSSECEncryptedToUnencryptedCopyPart() {
 	// Instantiate new core client object.
 	c := minio.Core{client}
 
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
-
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test")
 
@@ -10441,12 +9995,6 @@ func testSSECEncryptedToSSES3CopyObjectPart() {
 
 	// Instantiate new core client object.
 	c := minio.Core{client}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test")
@@ -10622,12 +10170,6 @@ func testUnencryptedToSSECCopyObjectPart() {
 	// Instantiate new core client object.
 	c := minio.Core{client}
 
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
-
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test")
 
@@ -10797,12 +10339,6 @@ func testUnencryptedToUnencryptedCopyPart() {
 	// Instantiate new core client object.
 	c := minio.Core{client}
 
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
-
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test")
 
@@ -10967,12 +10503,6 @@ func testUnencryptedToSSES3CopyObjectPart() {
 
 	// Instantiate new core client object.
 	c := minio.Core{client}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test")
@@ -11140,12 +10670,6 @@ func testSSES3EncryptedToSSECCopyObjectPart() {
 
 	// Instantiate new core client object.
 	c := minio.Core{client}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test")
@@ -11317,12 +10841,6 @@ func testSSES3EncryptedToUnencryptedCopyPart() {
 	// Instantiate new core client object.
 	c := minio.Core{client}
 
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
-
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test")
 
@@ -11488,12 +11006,6 @@ func testSSES3EncryptedToSSES3CopyObjectPart() {
 
 	// Instantiate new core client object.
 	c := minio.Core{client}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test")
@@ -12106,9 +11618,6 @@ func testPutObjectNoLengthV2() {
 		"opts":       "",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -12120,12 +11629,6 @@ func testPutObjectNoLengthV2() {
 		logError(testName, function, args, startTime, "", "MinIO client v2 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -12182,9 +11685,6 @@ func testPutObjectsUnknownV2() {
 		"opts":       "",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -12196,12 +11696,6 @@ func testPutObjectsUnknownV2() {
 		logError(testName, function, args, startTime, "", "MinIO client v2 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -12273,9 +11767,6 @@ func testPutObject0ByteV2() {
 		"opts":       "",
 	}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
@@ -12287,12 +11778,6 @@ func testPutObject0ByteV2() {
 		logError(testName, function, args, startTime, "", "MinIO client v2 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -12385,9 +11870,6 @@ func testFunctionalV2() {
 	functionAll := ""
 	args := map[string]interface{}{}
 
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
-
 	c, err := minio.New(os.Getenv(serverEndpoint),
 		&minio.Options{
 			Creds:     credentials.NewStaticV2(os.Getenv(accessKey), os.Getenv(secretKey), ""),
@@ -12401,9 +11883,6 @@ func testFunctionalV2() {
 
 	// Enable to debug
 	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -12838,8 +12317,6 @@ func testGetObjectContext() {
 		"bucketName": "",
 		"objectName": "",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -12852,12 +12329,6 @@ func testGetObjectContext() {
 		logError(testName, function, args, startTime, "", "MinIO client v4 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -12941,8 +12412,6 @@ func testFGetObjectContext() {
 		"objectName": "",
 		"fileName":   "",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -12955,12 +12424,6 @@ func testFGetObjectContext() {
 		logError(testName, function, args, startTime, "", "MinIO client v4 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -13044,12 +12507,6 @@ func testGetObjectRanges() {
 		logError(testName, function, args, startTime, "", "MinIO client v4 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rng, "minio-go-test-")
@@ -13140,8 +12597,6 @@ func testGetObjectACLContext() {
 		"bucketName": "",
 		"objectName": "",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -13154,12 +12609,6 @@ func testGetObjectACLContext() {
 		logError(testName, function, args, startTime, "", "MinIO client v4 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -13330,12 +12779,6 @@ func testPutObjectContextV2() {
 		return
 	}
 
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
-
 	// Make a new bucket.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
 	args["bucketName"] = bucketName
@@ -13390,8 +12833,6 @@ func testGetObjectContextV2() {
 		"bucketName": "",
 		"objectName": "",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -13404,12 +12845,6 @@ func testGetObjectContextV2() {
 		logError(testName, function, args, startTime, "", "MinIO client v2 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -13491,8 +12926,6 @@ func testFGetObjectContextV2() {
 		"objectName": "",
 		"fileName":   "",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -13505,12 +12938,6 @@ func testFGetObjectContextV2() {
 		logError(testName, function, args, startTime, "", "MinIO client v2 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -13580,8 +13007,6 @@ func testListObjects() {
 		"objectPrefix": "",
 		"recursive":    "true",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -13594,12 +13019,6 @@ func testListObjects() {
 		logError(testName, function, args, startTime, "", "MinIO client v4 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -13695,12 +13114,6 @@ func testCors() {
 		logError(testName, function, args, startTime, "", "MinIO client object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Create or reuse a bucket that will get cors settings applied to it and deleted when done
 	bucketName := os.Getenv("MINIO_GO_TEST_BUCKET_CORS")
@@ -14432,12 +13845,6 @@ func testCorsSetGetDelete() {
 		return
 	}
 
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
-
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
 	args["bucketName"] = bucketName
@@ -14519,8 +13926,6 @@ func testRemoveObjects() {
 		"objectPrefix": "",
 		"recursive":    "true",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -14533,12 +13938,6 @@ func testRemoveObjects() {
 		logError(testName, function, args, startTime, "", "MinIO client v4 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -14653,8 +14052,6 @@ func testGetBucketTagging() {
 	args := map[string]interface{}{
 		"bucketName": "",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -14667,12 +14064,6 @@ func testGetBucketTagging() {
 		logError(testName, function, args, startTime, "", "MinIO client v4 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -14709,8 +14100,6 @@ func testSetBucketTagging() {
 		"bucketName": "",
 		"tags":       "",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -14723,12 +14112,6 @@ func testSetBucketTagging() {
 		logError(testName, function, args, startTime, "", "MinIO client v4 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
@@ -14795,8 +14178,6 @@ func testRemoveBucketTagging() {
 	args := map[string]interface{}{
 		"bucketName": "",
 	}
-	// Seed random based on current time.
-	rand.Seed(time.Now().Unix())
 
 	// Instantiate new minio client object.
 	c, err := minio.New(os.Getenv(serverEndpoint),
@@ -14809,12 +14190,6 @@ func testRemoveBucketTagging() {
 		logError(testName, function, args, startTime, "", "MinIO client v4 object creation failed", err)
 		return
 	}
-
-	// Enable tracing, write to stderr.
-	// c.TraceOn(os.Stderr)
-
-	// Set user agent.
-	c.SetAppInfo("MinIO-go-FunctionalTest", appVersion)
 
 	// Generate a new random bucket name.
 	bucketName := randString(60, rand.NewSource(time.Now().UnixNano()), "minio-go-test-")
